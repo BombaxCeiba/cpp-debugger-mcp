@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpp-debugger-mcp"
+version = "0.1.0"
+description = "一个基于 MCP 协议的 C++ 调试工具，支持 AI 助手通过 lldb/gdb 调试 C++ 程序"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/BombaxCeiba/cpp-debugger-mcp"
+Repository = "https://github.com/BombaxCeiba/cpp-debugger-mcp"
+
+[project.scripts]
+cpp-debugger-mcp = "__main__:main"
+
+[tool.setuptools]
+py-modules = ["server", "debugger", "__main__"]
