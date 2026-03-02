@@ -65,201 +65,163 @@ _run_timeout: float = _args.run_timeout
 # 创建 MCP 服务实例
 mcp = FastMCP(
     "C++ Debugger MCP",
-    instructions="""这是一个 C++ 程序调试 MCP 服务，支持 lldb（优先）和 gdb 双后端。
-仅用于调试**已编译好的** C++ 可执行文件（需使用 -g 编译以包含调试信息），不负责编译。
+    instructions="""C++ 调试 MCP 服务，支持 lldb/gdb 双后端，仅调试已编译的 -g 可执行文件，不负责编译。
 
-## 调试器状态机（重要）
+# ═══════════════════════════════════════════════
+# 第一层：执行宪法（不可违反）
+# ═══════════════════════════════════════════════
 
-调试器有 5 种状态，你必须按顺序操作，不能跳过状态：
+█ 规则1（先验后动）：状态变更工具（debug_run/debug_continue/debug_step_*）返回后，先读 [状态:xxx] 标记和 next=[...] 白名单，再决定下一步。优先从 next 白名单选择工具；无白名单则查状态可用工具表。当 next=[...] 与状态可用工具表冲突时，以 next 为准（运行时动态推荐 > 静态表格）。若返回值中无 next 字段，则按状态可用工具表选择。
+█ 规则2（状态门控）：debug_get_variables、debug_evaluate、debug_source_context、debug_backtrace、debug_select_frame 仅在 [状态:已暂停] 时调用，其他状态调用无效。
+█ 规则3（超时恢复）：收到 [超时] → 第一步必须 debug_get_pending_output → 第二步可选 debug_get_program_output(mode="tail")。第一步完成前禁止任何其他工具。
+█ 规则4（结束确认）：[状态:已结束] → 禁止 debug_continue/debug_step_*/debug_get_variables/debug_evaluate → 仅允许 debug_get_program_output 查看输出、debug_run 重启、debug_stop 结束。
+█ 规则5（防空转）：同一状态变更工具连续调用 3 次且 [状态:xxx] 未变化即为无进展 → 必须切换策略（debug_list_breakpoints 检查断点 / debug_get_program_output(mode="tail") 查看输出 / 检查编译选项）并向用户说明。查询类工具（debug_get_pending_output/debug_get_program_output）不重置计数。
+█ 规则6（输出获取）：程序 printf/cout 内容用 debug_get_program_output 获取，不从调试返回值拼凑。输出量大时优先 mode="tail"。
+█ 规则7（兜底校验）：若工具返回不含 [状态:xxx] 标记，或标记与预期冲突 → 先调 debug_get_pending_output + debug_list_debuggers 做一致性校验 → 再决定下一步。
+█ 规则8（raw_command 护栏）：debug_raw_command 仅在标准工具无法覆盖时才调用；调用前须在回复中自说明原因与预期影响，调用后必须立即做状态校验（读取 [状态:xxx] + next 确认）。
+
+优先级：执行宪法 > 决策参考表 > 示例流程
+
+# ═══════════════════════════════════════════════
+# 第二层：决策参考（结构化表格）
+# ═══════════════════════════════════════════════
+
+## 调试器状态机
 
   [状态:未启动] --debug_start--> [状态:已启动] --debug_load--> [状态:已加载]
   [状态:已加载] --debug_run--> [状态:运行中]/[状态:已暂停]
   [状态:已暂停] --debug_continue/step_*--> [状态:运行中]/[状态:已暂停]
   [任意状态] --debug_stop--> [状态:未启动]
 
-### 各状态可用的工具：
-- **未启动**：仅可调用 debug_start
-- **已启动**：仅可调用 debug_load, debug_stop
-- **已加载**：可调用 debug_set_breakpoint, debug_run, debug_stop（建议先设断点再 run）
-- **已暂停**（程序在断点/单步处停下）：可调用所有检查和控制工具
-- **运行中**：程序正在执行，等待其在断点处暂停。超时后可调用 debug_get_pending_output 检查状态
+### 各状态可用工具表
+| 状态 | 可用工具 |
+|---|---|
+| 未启动 | 仅 debug_start |
+| 已启动 | debug_load, debug_stop |
+| 已加载 | debug_set_breakpoint, debug_run, debug_stop（建议先设断点再 run） |
+| 已暂停 | 所有检查和控制工具 |
+| 运行中 | debug_get_pending_output, debug_get_program_output, debug_continue, debug_stop |
 
-注意：debug_get_program_output 可在程序运行过（至少调用过 debug_run）的任何状态下使用，用于查看程序的 stdout/stderr 输出。
+注意：debug_get_program_output 可在程序运行过（至少调用过 debug_run）的任何状态下使用。
 
-### 关键规则：
-1. 检查变量(debug_get_variables)、求值(debug_evaluate)、查看源码(debug_source_context)、查看调用栈(debug_backtrace) 等工具，只有在程序处于**已暂停**状态时才有效
-2. 如果程序已经结束（运行完毕），需要 debug_run 重新启动，无需再 load
-3. debug_raw_command 可在已启动后的任何状态使用，但需自行确保命令语法正确
-4. 调试多线程程序时，先用 debug_thread_list 查看线程，再用 debug_select_thread 切换
-5. 调用栈中 frame 0 是最内层（当前执行点），可用 debug_select_frame 切换帧后再查看变量
+## 返回值状态标记表
 
-## 超时处理（极其重要）
-
-debug_run、debug_continue、debug_step_out 是长时间运行的工具，执行期间程序会运行直到断点或结束。
-服务已通过 --run-timeout 参数配置了超时时间（默认 30 秒）。
-
-### 超时处理流程（必须遵守）：
-1. 当这三个工具返回 **[超时]** 提示时，说明程序仍在运行中但等待时间已超出
-2. **第一步（必须）：立即调用 debug_get_pending_output** 获取缓存的输出，恢复调试器交互状态
-3. 根据返回结果中的 **[状态:xxx]** 标记判断：
-   - **[状态:已暂停]**：断点已命中，可以继续使用检查类工具
-   - **[状态:运行中]**：程序还在执行，可再次调用 debug_continue 继续等待
-   - **[状态:已结束]**：程序已退出，可查看输出或重新运行
-4. 可以多次调用 debug_get_pending_output 来轮询状态
-5. **第二步（可选）：** 在完成第一步后，可调用 debug_get_program_output(mode="tail") 查看程序最新的打印输出，帮助判断程序执行进度。注意：此步骤不能替代第一步，必须先完成 debug_get_pending_output
-
-### 建议：
-- 调用 debug_run/debug_continue/debug_step_out 时请适当调大客户端超时设置（如 60-120 秒）
-- 不要因为超时就认为程序卡死，可能只是需要更长运行时间
-
-## 环境变量
-
-debug_start 支持传入 env_vars 参数（JSON 字符串格式），指定的环境变量会：
-1. 透传给调试器子进程本身
-2. 在 debug_load 加载目标程序时自动设置，确保被调试程序也能获取这些环境变量
-示例：debug_start(env_vars='{"MY_VAR": "hello", "LD_LIBRARY_PATH": "/opt/lib"}')
-
-## 典型调试流程
-
-debug_start → debug_load("./程序") → debug_set_breakpoint("main") → debug_run()
-→ [状态:已暂停] → debug_source_context() 看代码 → debug_get_variables() 看变量
-→ debug_step_over()/debug_continue() → ... → debug_stop()
-
-在任何暂停点或程序结束后，都可以调用 debug_get_program_output() 查看程序截至目前的所有打印输出。
-输出量大时，使用 mode="tail" 只看最新的 N 行，避免 token 浪费。
-
-### 小程序快速调试流程（推荐）
-debug_start → debug_load("./程序") → debug_run(stop_at_entry=True)
-→ [状态:已暂停 - main 入口] → debug_source_context() 看代码 → debug_set_breakpoint(...) 按需设断点
-→ debug_continue() → ... → debug_stop()
-
-注意：对于小型程序，建议使用 stop_at_entry=True 启动，这样程序会在 main 函数入口自动暂停，
-agent 有充足时间查看代码、设置断点，不用担心程序瞬间执行完毕。
-
-### 超时场景的调试流程
-debug_run() → 返回 [超时] → debug_get_pending_output() → [状态:已暂停] → 正常调试
-debug_run() → 返回 [超时] → debug_get_pending_output() → [状态:运行中] → debug_continue() → ...
-
-## 返回值状态标记（重要）
-
-所有关键工具的返回值都包含 **[状态:xxx]** 前缀标记，你应该优先根据此标记判断当前状态，而非仅靠自然语言理解：
-
-| 状态标记 | 含义 | 允许的后续操作 |
+| 标记 | 含义 | 允许的后续操作 |
 |---|---|---|
 | [状态:未启动] | 调试器未启动或已关闭 | 仅 debug_start |
 | [状态:已启动] | 调试会话已启动，未加载程序 | debug_load, debug_stop |
 | [状态:已加载] | 可执行文件已加载 | debug_set_breakpoint, debug_run, debug_stop |
 | [状态:已暂停] | 程序在断点/单步处停下 | 所有工具均可用 |
-| [状态:运行中] | 程序正在执行中 | debug_get_pending_output, debug_get_program_output, debug_stop |
-| [状态:已结束] | 程序已退出（正常或异常） | debug_get_program_output 查看输出, debug_run 重启, debug_stop 结束 |
-| [超时] | 等待超时，程序可能仍在运行 | 第一步（必须）：debug_get_pending_output；第二步（可选）：debug_get_program_output(mode="tail") |
-| [错误] | 操作失败 | 根据失败分型策略表恢复 |
+| [状态:运行中] | 程序正在执行中 | debug_get_pending_output, debug_get_program_output, debug_continue, debug_stop |
+| [状态:已结束] | 程序已退出 | debug_get_program_output, debug_run 重启, debug_stop 结束（规则4） |
+| [超时] | 等待超时，程序可能仍在运行 | debug_get_pending_output → 可选 debug_get_program_output(mode="tail")（规则3） |
+| [错误] | 操作失败 | 按失败分型表恢复 |
 
-注意：关键状态转换工具（debug_run、debug_continue、debug_step_out）的返回值中还包含 **next=[...]** 白名单，
-列出了当前状态下推荐的后续工具。你应优先从 next 列表中选择下一步操作。
+关键状态转换工具（debug_run、debug_continue、debug_step_out）的返回值还包含 **next=[...]** 白名单，列出推荐的后续工具。
 
-**决策流程**：收到工具返回 → 读取 [状态:xxx] 标记 → 查看 next=[...] 白名单 → 优先从白名单中选择下一步工具 → 如无白名单则查表确认允许的操作。
+## 失败分型与恢复策略
 
-## 排错提示
-- 如果工具返回"进程未启动"，说明你需要先 debug_start
-- 如果工具返回空或无效结果，可能程序未暂停或已结束
-- 如果断点未命中，检查文件名/行号是否正确，程序是否带 -g 编译
-- 如果工具返回 [超时]，不要慌张，按照上述超时处理流程操作即可
-
-## 失败分型与恢复策略（必须遵守）
-
-遇到错误时，根据以下策略表选择恢复动作，不要盲目猜测：
-
-| 错误类型 | 典型返回信息 | 恢复策略 | 禁止动作 |
+| 错误类型 | 典型返回信息 | 恢复策略（自足摘要） | 禁止动作 |
 |---|---|---|---|
-| 进程未启动 | "进程未启动"、RuntimeError | 只允许调用 debug_start | 禁止一切其他工具 |
-| 目标未加载 | 加载相关错误 | 先 debug_load 加载可执行文件 | 禁止 debug_run, debug_set_breakpoint |
-| 程序未暂停 | 检查类工具返回空/无效结果 | **先判定当前 [状态:xxx] 再选动作**（见下方明细） | **禁止** debug_get_variables, debug_evaluate, debug_source_context, debug_backtrace, debug_step_over, debug_step_into, debug_select_frame |
-| 程序已结束 | "exited"、"process exited" | **先判定当前 [状态:xxx] 再选动作**（见下方明细） | **禁止** debug_continue, debug_step_*, debug_get_variables, debug_evaluate |
-| 断点未命中 | 程序运行结束但未暂停 | 1. debug_list_breakpoints 检查断点 2. 确认文件名/行号 3. 确认 -g 编译 | 禁止反复 debug_run 而不检查断点 |
+| 进程未启动 | "进程未启动"、RuntimeError | 仅 debug_start | 禁止一切其他工具 |
+| 目标未加载 | 加载相关错误 | debug_load 加载可执行文件 | 禁止 debug_run, debug_set_breakpoint |
+| 程序未暂停 | 检查类工具返回空/无效 | 按当前 [状态:xxx] 分支：运行中→debug_get_pending_output 轮询；未启动→debug_start；已启动→debug_load→debug_run；已加载→debug_run；已结束→debug_get_program_output 或 debug_run 重启 | 禁止 debug_get_variables/debug_evaluate/debug_source_context/debug_backtrace/debug_step_*/debug_select_frame（规则2） |
+| 程序已结束 | "exited"、"process exited" | debug_get_program_output 查看输出 / debug_run 重启 / debug_stop 结束；若实际 [状态:已暂停] 则程序仍在暂停中可正常检查；若实际 [状态:运行中] 则 debug_get_pending_output 轮询 | 禁止 debug_continue/debug_step_*/debug_get_variables/debug_evaluate（规则4） |
+| 断点未命中 | 程序运行结束但未暂停 | debug_list_breakpoints 检查断点 → 确认文件名/行号 → 确认 -g 编译 | 禁止反复 debug_run 而不检查断点 |
 | 符号未找到 | "symbol not found" | 检查函数名拼写；确认 -g 编译且未被 strip | — |
 | 变量不可用 | "variable not available" | 可能被优化掉，建议 -O0 编译 | — |
-| 超时 | "[超时]" | 第一步（必须）：debug_get_pending_output 恢复状态；第二步（可选）：debug_get_program_output(mode="tail") 查看输出 | **禁止** debug_get_variables, debug_evaluate 等检查类工具（必须先完成第一步恢复） |
+| 超时 | "[超时]" | debug_get_pending_output（必须）→ debug_get_program_output(mode="tail")（可选）（规则3） | 禁止 debug_get_variables/debug_evaluate 等检查类工具（规则2） |
 | 文件不存在 | "文件不存在" | 检查可执行文件路径是否正确 | — |
 
-### 状态感知恢复明细
+## 超时处理流程
 
-上表中标注"先判定当前 [状态:xxx] 再选动作"的错误类型，必须按以下分支选择恢复路径：
+debug_run、debug_continue、debug_step_out 可能因程序长时间运行而超时（默认 30 秒，可通过 --run-timeout 配置）。
 
-**"程序未暂停"恢复分支：**
-- 若当前 [状态:运行中] → debug_get_pending_output 轮询，或 debug_continue 继续等待断点
-- 若当前 [状态:未启动] → 需先 debug_start 启动调试会话
-- 若当前 [状态:已启动] → 需先 debug_load 加载可执行文件，再 debug_run
-- 若当前 [状态:已加载] → 需先 debug_run 启动程序
-- 若当前 [状态:已结束] → 程序已退出，debug_get_program_output 查看输出，或 debug_run 重启
-
-**"程序已结束"恢复分支：**
-- 若当前 [状态:已结束] → debug_get_program_output 查看输出，debug_run 重新启动，或 debug_stop 结束会话
-- 若当前 [状态:已暂停] → 状态判断有误，程序仍在暂停中，可正常使用检查类工具
-- 若当前 [状态:运行中] → 状态判断有误，程序仍在运行，应 debug_get_pending_output 轮询
-
-## 行为约束规则（必须遵守）
-
-规则1（先验证后行动）：执行 debug_run、debug_continue、debug_step_* 等状态变更命令后，必须先根据返回值判断当前程序状态（已暂停/运行中/已结束），再决定下一步操作。
-规则2（超时恢复）：收到 [超时] 返回后，第一恢复动作必须是 debug_get_pending_output；完成后可选调用 debug_get_program_output(mode="tail") 补充判断程序输出。在完成第一步之前，禁止调用任何其他工具。
-规则3（状态门控）：检查类工具（debug_get_variables、debug_evaluate、debug_source_context、debug_backtrace 等）仅在程序处于 [状态:已暂停] 时调用。
-规则4（防空转）：同一无进展动作最多重试 3 次，之后必须切换策略并向用户说明原因。
-  - 判定标准：连续 N 次调用同一状态变更工具（如 debug_continue）且返回的 [状态:xxx] 标记未发生变化（如始终为 [状态:运行中]），即为无进展。
-  - 中间穿插的纯查询类调用（debug_get_pending_output、debug_get_program_output）不重置重试计数。
-  - 达到 3 次后应切换策略：用 debug_list_breakpoints 检查断点、用 debug_get_program_output(mode="tail") 查看程序输出、检查程序参数或编译选项。
-规则5（结束确认）：如果返回值中包含程序退出信息（exited、terminated 等），当前状态为 [状态:已结束]，不要尝试检查变量或继续执行，应决定是 debug_run 重启还是 debug_stop 结束会话。
-规则6（查看程序输出）：如果需要了解程序的 printf/cout 打印内容，使用 debug_get_program_output 而非从调试命令的返回值中拼凑。输出量大时优先使用 tail 模式查看最新内容，节省 token。
+1. 收到 **[超时]** → 程序仍在运行，输出已缓存
+2. **第一步（必须）**：debug_get_pending_output → 读取 [状态:xxx] 判断：
+   - [状态:已暂停]：断点已命中，继续检查
+   - [状态:运行中]：程序还在执行，可 debug_continue 继续等待
+   - [状态:已结束]：程序已退出，查看输出或重新运行
+3. **第二步（可选）**：debug_get_program_output(mode="tail") 查看程序打印输出
+4. 可多次 debug_get_pending_output 轮询状态
+5. 建议客户端超时设置 60-120 秒；超时不代表程序卡死
 
 ## 多进程调试（IPC 场景）
 
-本服务支持同时调试多个进程（父进程 + 子进程），通过多调试器实例实现。
-每个调试器实例独立控制一个进程，互不干扰。
+通过多调试器实例同时调试多个进程，每个实例独立控制一个进程。
 
 ### 核心概念
-- **调试器 #0**：主调试器（launch 模式），通过 debug_start → debug_load → debug_run 启动
+- **调试器 #0**：主调试器（launch 模式），debug_start → debug_load → debug_run
 - **调试器 #1, #2, ...**：子调试器（attach 模式），通过 debug_attach_child(pid) 创建
-- **debugger_id**：所有调试工具都支持此可选参数（默认 0），用于指定操作目标
+- **debugger_id**：所有工具的可选参数（默认 0），指定操作目标
+- 优先处理最近产生状态变化的 debugger_id，避免无意义轮询
 
-### 多进程调试新增工具
-- **debug_list_children(debugger_id=0)**：列出指定进程的所有直接子进程（PID + 进程名）
-- **debug_attach_child(pid)**：创建新调试器实例并附加到子进程，返回分配的调试器编号
-- **debug_detach(debugger_id)**：从子进程脱离并关闭对应调试器实例（不能 detach #0）
-- **debug_list_debuggers()**：列出所有活跃的调试器实例及其状态
+### 多进程工具
+- debug_list_children(debugger_id=0)：列出子进程（PID + 进程名）
+- debug_attach_child(pid)：创建新实例并附加到子进程
+- debug_detach(debugger_id)：脱离子进程并关闭实例（不能 detach #0）
+- debug_list_debuggers()：列出所有活跃实例及状态
 
 ### 返回值标注
-所有工具的返回值都包含 **[调试器 #N][进程: xxx (PID: xxx)]** 前缀标签，用于区分不同实例的输出：
-```
-[调试器 #0][进程: parent_app (PID: 12345)]
-[状态:已暂停] Breakpoint 1, main() at parent.cpp:10
-
-[调试器 #1][进程: PID-12346 (PID: 12346)]
-[状态:已暂停] Breakpoint 1, on_message() at child.cpp:25
-```
-
-### 典型 IPC 调试流程
-1. debug_start → debug_load("./parent") → debug_set_breakpoint("main") → debug_run(stop_at_entry=True)
-2. debug_list_children() → 找到子进程 PID
-3. debug_attach_child(child_pid) → 获得调试器 #1
-4. debug_set_breakpoint("on_message", debugger_id=1) → 在子进程设断点
-5. debug_continue(debugger_id=0) → 父进程继续执行
-6. debug_get_pending_output(debugger_id=1) → 检查子进程是否命中断点
-7. debug_get_variables(debugger_id=1) → 查看子进程变量
-8. debug_detach(debugger_id=1) → 完成后脱离子进程
-9. debug_stop() → 结束所有调试
+所有返回值包含 **[调试器 #N][进程: xxx (PID: xxx)]** 前缀标签。
 
 ### attach 模式限制
-- attach 模式的调试器（#1+）不能调用 debug_run 和 debug_load，只能用 debug_continue 继续执行
-- 最多同时运行 5 个调试器实例
+- attach 模式（#1+）不能调用 debug_run/debug_load，用 debug_continue 代替
+- 最多同时 5 个调试器实例
 
-### 失败分型（多进程相关）
+### 多进程失败分型
 
 | 错误类型 | 典型返回信息 | 恢复策略 |
 |---|---|---|
 | attach 失败 | "无法附加到进程" | 检查 PID 是否正确、进程是否存在、是否需要管理员权限 |
-| 实例不存在 | "调试器 #N 不存在" | 调用 debug_list_debuggers 查看可用实例 |
+| 实例不存在 | "调试器 #N 不存在" | debug_list_debuggers 查看可用实例 |
 | 实例数量上限 | "实例数量已达上限" | 先 debug_detach 不需要的实例 |
-| 无法 detach 主调试器 | "无法脱离主调试器" | 使用 debug_stop 结束整个调试会话 |
+| 无法 detach 主调试器 | "无法脱离主调试器" | 使用 debug_stop 结束整个会话 |
 | attach 模式下调用 run/load | "附加模式下无法..." | 使用 debug_continue 代替 debug_run |
+
+# ═══════════════════════════════════════════════
+# 第三层：示例与背景（按需阅读）
+# ═══════════════════════════════════════════════
+
+## 典型调试流程
+
+debug_start → debug_load("./程序") → debug_set_breakpoint("main") → debug_run()
+→ [状态:已暂停] → debug_source_context() → debug_get_variables()
+→ debug_step_over()/debug_continue() → ... → debug_stop()
+
+随时可调用 debug_get_program_output() 查看程序打印输出。输出量大时用 mode="tail"。
+
+### 小程序快速调试（推荐）
+debug_start → debug_load("./程序") → debug_run(stop_at_entry=True)
+→ [状态:已暂停 - main 入口] → debug_source_context() → debug_set_breakpoint(...)
+→ debug_continue() → ... → debug_stop()
+
+小型程序建议 stop_at_entry=True，程序会在 main 入口自动暂停，有充足时间查看代码和设置断点。
+
+### 超时场景调试
+debug_run() → [超时] → debug_get_pending_output() → [状态:已暂停] → 正常调试
+debug_run() → [超时] → debug_get_pending_output() → [状态:运行中] → debug_continue() → ...
+
+### IPC 调试流程
+1. debug_start → debug_load("./parent") → debug_run(stop_at_entry=True)
+2. debug_list_children() → 找到子进程 PID
+3. debug_attach_child(child_pid) → 获得调试器 #1
+4. debug_set_breakpoint("on_message", debugger_id=1)
+5. debug_continue(debugger_id=0) → 父进程继续
+6. debug_get_pending_output(debugger_id=1) → 检查子进程断点
+7. debug_get_variables(debugger_id=1) → 查看子进程变量
+8. debug_detach(debugger_id=1) → 脱离子进程
+9. debug_stop() → 结束所有调试
+
+## 环境变量
+
+debug_start 支持 env_vars 参数（JSON 字符串），环境变量会透传给调试器和被调试程序。
+示例：debug_start(env_vars='{"MY_VAR": "hello", "LD_LIBRARY_PATH": "/opt/lib"}')
+
+## 补充说明
+- 调试多线程：先 debug_thread_list 查看线程，再 debug_select_thread 切换
+- 调用栈 frame 0 是最内层，用 debug_select_frame 切换帧后再查看变量
+- 程序结束后可 debug_run 重新启动，无需再 debug_load
 """,
 )
 
