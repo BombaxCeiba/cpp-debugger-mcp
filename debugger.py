@@ -13,6 +13,9 @@ import re
 import shutil
 import platform
 from typing import Optional
+from logger import get_logger
+
+_logger = get_logger("debugger")
 
 
 class DebuggerBackend:
@@ -235,8 +238,7 @@ class DebuggerBackend:
                 elapsed = time.time() - start_time
                 return (f"[超时] [状态:运行中] 程序仍在运行中，已等待 {elapsed:.0f} 秒但未暂停。\n"
                         f"已收集到的部分输出已缓存。\n"
-                        f"next=[debug_get_pending_output]\n"
-                        f"提示：也可调用 debug_get_program_output(mode='tail') 查看程序最新的打印输出。")
+                        f"next=[debug_get_pending_output, debug_get_program_output]")
 
             # 将输出追加到程序输出缓存
             self._accumulate_program_output(result)
@@ -295,7 +297,19 @@ class DebuggerBackend:
         self._pending_output = ""
 
         if not combined:
-            return "[状态:运行中] 没有待处理的缓存输出。程序可能仍在运行中，也可能已经在断点处暂停。\nnext=[debug_get_pending_output, debug_get_program_output, debug_stop]"
+            # 没有调试器输出时，自动附带程序输出最后10行，减少 Agent 额外调用
+            tail_info = ""
+            if self._program_output_lines:
+                tail_lines = self._program_output_lines[-10:]
+                total = len(self._program_output_lines)
+                shown = len(tail_lines)
+                tail_content = "\n".join(tail_lines)
+                tail_info = (f"\n[以下为 debug_get_program_output 的最后 {shown} 行（共 {total} 行）]\n"
+                             f"{'─' * 40}\n{tail_content}\n{'─' * 40}")
+            return (f"[状态:待确认] 没有待处理的缓存输出。程序可能仍在运行中，也可能已经在断点处暂停。"
+                    f"建议再次调用 debug_get_pending_output 确认状态。"
+                    f"{tail_info}\n"
+                    f"next=[debug_get_pending_output, debug_get_program_output, debug_stop]")
 
         # 将获取到的输出也追加到程序输出缓存
         self._accumulate_program_output(combined)
@@ -312,8 +326,7 @@ class DebuggerBackend:
                     f"next=[debug_source_context, debug_get_variables, debug_backtrace, debug_step_over, debug_step_into, debug_continue]")
         else:
             return (f"[状态:运行中] 程序可能仍在运行，尚未暂停。以下是目前收集到的输出：\n{combined}\n"
-                    f"next=[debug_get_pending_output, debug_get_program_output, debug_stop]\n"
-                    f"提示：可调用 debug_get_program_output(mode='tail') 查看程序最新的打印输出。")
+                    f"next=[debug_get_program_output, debug_get_pending_output, debug_stop]")
 
     def _build_subprocess_env(self) -> Optional[dict]:
         """构建传给子进程的环境变量字典。如果没有自定义环境变量则返回 None（继承父进程环境）"""
@@ -332,10 +345,15 @@ class DebuggerBackend:
                                        "exited with code", "terminated",
                                        "process finished", "inferior exited"]):
             return "[状态:已结束]"
-        # 检测断点命中 / 程序暂停
-        if any(kw in lower for kw in ["breakpoint", "stop reason", "stopped",
-                                       "watchpoint", "signal", "frame #",
-                                       "at line", "hit breakpoint"]):
+        # 检测断点命中 / 程序暂停（使用更精确的模式避免误判，如 'Breakpoint 1 deleted' 不应判为暂停）
+        pause_keywords = ["stop reason", "stopped", "watchpoint",
+                          "frame #", "at line", "hit breakpoint"]
+        # "breakpoint" 需要排除 "breakpoint deleted" / "breakpoint removed" 等维护性输出
+        if any(kw in lower for kw in pause_keywords):
+            return "[状态:已暂停]"
+        if "breakpoint" in lower and not any(ex in lower for ex in ["deleted", "removed", "cleared", "pending"]):
+            return "[状态:已暂停]"
+        if "signal" in lower and not any(ex in lower for ex in ["signal handler", "handle signal"]):
             return "[状态:已暂停]"
         # 如果有提示符出现（说明命令已完成，程序已暂停在调试器控制下）
         prompt_pattern = self._get_prompt_pattern()
@@ -425,13 +443,13 @@ class DebuggerBackend:
     def get_pending_output_safe(self) -> str:
         """安全版本的 get_pending_output，即使未启动也不会抛异常"""
         if not self.is_active:
-            return "[状态:未启动] 调试器未启动，没有待处理的输出。"
+            return "[状态:未启动] 调试器未启动，没有待处理的输出。\nnext=[debug_start]"
         return self.get_pending_output()
 
     def get_program_output_safe(self, mode: str = "all", lines: int = 20) -> str:
         """安全版本的 get_program_output，即使未启动也不会抛异常"""
         if not self.is_active:
-            return "[状态:未启动] 调试器未启动，没有程序输出。"
+            return "[状态:未启动] 调试器未启动，没有程序输出。\nnext=[debug_start]"
         return self.get_program_output(mode=mode, lines=lines)
 
     def reset_program_output(self):
@@ -505,6 +523,7 @@ class LLDBBackend(DebuggerBackend):
         if not lldb_path:
             raise FileNotFoundError("未找到 lldb。请确保 LLVM 工具链已安装且 lldb 在 PATH 中。")
 
+        _logger.info("启动 lldb 进程: %s", lldb_path)
         self._process = subprocess.Popen(
             [lldb_path],
             stdin=subprocess.PIPE,
@@ -539,6 +558,7 @@ class LLDBBackend(DebuggerBackend):
             msg += (f"可能原因：lldb 版本不兼容、依赖库缺失、或系统环境异常。\n"
                     f"请检查 lldb 是否能在命令行中正常启动。\n"
                     f"next=[debug_start]")
+            _logger.error("lldb 启动失败（退出码: %d）: %s", exit_code, error_detail)
             return msg
 
         output = self._collect_output(timeout=3.0)
@@ -552,12 +572,14 @@ class LLDBBackend(DebuggerBackend):
                     f"请检查 lldb 是否能在命令行中正常运行。\n"
                     f"next=[debug_start]")
 
-        return f"[状态:已启动] **调试后端: lldb**\nlldb 调试会话已启动。\n{output}"
+        _logger.info("lldb 调试会话已启动")
+        return f"[状态:已启动] **调试后端: lldb**\nlldb 调试会话已启动。\n{output}\nnext=[debug_load, debug_stop]"
 
     def stop(self) -> str:
         if not self.is_active:
             self._process = None
-            return "[状态:未启动] lldb 会话未在运行。"
+            return "[状态:未启动] lldb 会话未在运行。\nnext=[debug_start]"
+        _logger.info("停止 lldb 调试会话")
         try:
             self._process.stdin.write("quit\n")
             self._process.stdin.flush()
@@ -566,12 +588,14 @@ class LLDBBackend(DebuggerBackend):
             self._process.kill()
         self._process = None
         self._is_running = False
-        return "[状态:未启动] lldb 调试会话已关闭。"
+        return "[状态:未启动] lldb 调试会话已关闭。\nnext=[debug_start]"
 
     def load_target(self, executable_path: str) -> str:
         if not os.path.isfile(executable_path):
-            return "[错误] 文件不存在：{}".format(executable_path)
+            _logger.warning("[lldb] 文件不存在: %s", executable_path)
+            return "[错误] 文件不存在：{}\nnext=[debug_load]".format(executable_path)
         self._target_path = os.path.abspath(executable_path)
+        _logger.info("[lldb] 加载目标程序: %s", self._target_path)
         result = self._send_command(f'file "{self._target_path}"')
         # 加载目标后，将环境变量设置给被调试程序
         env_result = self._apply_env_to_target()
@@ -580,7 +604,7 @@ class LLDBBackend(DebuggerBackend):
             env_info = f"\n已设置 {len(self._env_vars)} 个环境变量：{', '.join(self._env_vars.keys())}"
             if env_result:
                 env_info += f"\n{env_result}"
-        return f"[状态:已加载] 已加载目标程序：{self._target_path}\n{result}{env_info}"
+        return f"[状态:已加载] 已加载目标程序：{self._target_path}\n{result}{env_info}\nnext=[debug_set_breakpoint, debug_run, debug_stop]"
 
     def set_breakpoint(self, location: str, condition: str = "") -> str:
         # 构建基础断点命令
@@ -605,6 +629,7 @@ class LLDBBackend(DebuggerBackend):
         return self._send_command("breakpoint list")
 
     def run(self, args: str = "", stop_at_entry: bool = False) -> str:
+        _logger.info("[lldb] run 命令，args=%s, stop_at_entry=%s", args, stop_at_entry)
         self._is_running = True
         # 重新运行时清空程序输出缓存
         self.reset_program_output()
@@ -615,11 +640,12 @@ class LLDBBackend(DebuggerBackend):
         result = self._send_long_command(cmd, timeout=self.run_timeout)
         if stop_at_entry and "[超时]" not in result:
             result += ("\n\n[入口暂停] 程序已在 main 函数入口处暂停（临时断点已自动删除）。\n"
-                       "next=[debug_source_context, debug_set_breakpoint, debug_get_variables, debug_continue]")
+                       "next=[debug_source_context, debug_set_breakpoint, debug_get_variables, debug_step_over, debug_step_into, debug_continue]")
         return result
 
     def continue_execution(self) -> str:
         return self._send_long_command("continue", timeout=self.run_timeout)
+
 
     def step_over(self) -> str:
         return self._send_command("next")
@@ -667,10 +693,12 @@ class LLDBBackend(DebuggerBackend):
 
     def attach(self, pid: int) -> str:
         """附加到指定 PID 的进程"""
+        _logger.info("[lldb] attach 到进程 PID=%d", pid)
         return self._send_command(f"process attach -p {pid}", timeout=10.0)
 
     def detach(self) -> str:
         """从当前调试的进程脱离"""
+        _logger.info("[lldb] detach")
         return self._send_command("process detach", timeout=5.0)
 
 
@@ -740,6 +768,7 @@ class GDBBackend(DebuggerBackend):
         if not gdb_path:
             raise FileNotFoundError("未找到 gdb。请确保 GDB 已安装且在 PATH 中。")
 
+        _logger.info("启动 gdb 进程: %s", gdb_path)
         self._process = subprocess.Popen(
             [gdb_path, "-q"],  # -q: 静默启动，不打印版本信息
             stdin=subprocess.PIPE,
@@ -774,6 +803,7 @@ class GDBBackend(DebuggerBackend):
             msg += (f"可能原因：gdb 版本不兼容、依赖库缺失、或系统环境异常。\n"
                     f"请检查 gdb 是否能在命令行中正常启动。\n"
                     f"next=[debug_start]")
+            _logger.error("gdb 启动失败（退出码: %d）: %s", exit_code, error_detail)
             return msg
 
         output = self._collect_output(timeout=3.0)
@@ -787,12 +817,14 @@ class GDBBackend(DebuggerBackend):
                     f"请检查 gdb 是否能在命令行中正常运行。\n"
                     f"next=[debug_start]")
 
-        return f"[状态:已启动] **调试后端: gdb**\ngdb 调试会话已启动。\n{output}"
+        _logger.info("gdb 调试会话已启动")
+        return f"[状态:已启动] **调试后端: gdb**\ngdb 调试会话已启动。\n{output}\nnext=[debug_load, debug_stop]"
 
     def stop(self) -> str:
         if not self.is_active:
             self._process = None
-            return "[状态:未启动] gdb 会话未在运行。"
+            return "[状态:未启动] gdb 会话未在运行。\nnext=[debug_start]"
+        _logger.info("停止 gdb 调试会话")
         try:
             self._process.stdin.write("quit\n")
             self._process.stdin.flush()
@@ -806,12 +838,14 @@ class GDBBackend(DebuggerBackend):
             self._process.kill()
         self._process = None
         self._is_running = False
-        return "[状态:未启动] gdb 调试会话已关闭。"
+        return "[状态:未启动] gdb 调试会话已关闭。\nnext=[debug_start]"
 
     def load_target(self, executable_path: str) -> str:
         if not os.path.isfile(executable_path):
-            return "[错误] 文件不存在：{}".format(executable_path)
+            _logger.warning("[gdb] 文件不存在: %s", executable_path)
+            return "[错误] 文件不存在：{}\nnext=[debug_load]".format(executable_path)
         self._target_path = os.path.abspath(executable_path)
+        _logger.info("[gdb] 加载目标程序: %s", self._target_path)
         result = self._send_command(f'file "{self._target_path}"')
         # 加载目标后，将环境变量设置给被调试程序
         env_result = self._apply_env_to_target()
@@ -820,7 +854,7 @@ class GDBBackend(DebuggerBackend):
             env_info = f"\n已设置 {len(self._env_vars)} 个环境变量：{', '.join(self._env_vars.keys())}"
             if env_result:
                 env_info += f"\n{env_result}"
-        return f"[状态:已加载] 已加载目标程序：{self._target_path}\n{result}{env_info}"
+        return f"[状态:已加载] 已加载目标程序：{self._target_path}\n{result}{env_info}\nnext=[debug_set_breakpoint, debug_run, debug_stop]"
 
     def set_breakpoint(self, location: str, condition: str = "") -> str:
         # gdb 的 break 命令直接支持 函数名 和 文件:行号 格式
@@ -845,6 +879,7 @@ class GDBBackend(DebuggerBackend):
         return self._send_command("info breakpoints")
 
     def run(self, args: str = "", stop_at_entry: bool = False) -> str:
+        _logger.info("[gdb] run 命令，args=%s, stop_at_entry=%s", args, stop_at_entry)
         self._is_running = True
         # 重新运行时清空程序输出缓存
         self.reset_program_output()
@@ -856,11 +891,12 @@ class GDBBackend(DebuggerBackend):
         result = self._send_long_command("run", timeout=self.run_timeout)
         if stop_at_entry and "[超时]" not in result:
             result += ("\n\n[入口暂停] 程序已在 main 函数入口处暂停（临时断点已自动删除）。\n"
-                       "next=[debug_source_context, debug_set_breakpoint, debug_get_variables, debug_continue]")
+                       "next=[debug_source_context, debug_set_breakpoint, debug_get_variables, debug_step_over, debug_step_into, debug_continue]")
         return result
 
     def continue_execution(self) -> str:
         return self._send_long_command("continue", timeout=self.run_timeout)
+
 
     def step_over(self) -> str:
         return self._send_command("next")
@@ -909,16 +945,17 @@ class GDBBackend(DebuggerBackend):
 
     def attach(self, pid: int) -> str:
         """附加到指定 PID 的进程"""
+        _logger.info("[gdb] attach 到进程 PID=%d", pid)
         return self._send_command(f"attach {pid}", timeout=10.0)
 
     def detach(self) -> str:
         """从当前调试的进程脱离"""
+        _logger.info("[gdb] detach")
         return self._send_command("detach", timeout=5.0)
 
 
 # ====================================================================
-# 跨平台子进程列表获取（纯标准库实现）
-# ====================================================================
+# 跨平台子进程列表获取# ====================================================================
 
 
 def list_child_processes(parent_pid: int) -> list:
@@ -1004,6 +1041,16 @@ def _list_child_processes_windows(parent_pid: int) -> list:
 
     kernel32 = ctypes.windll.kernel32
 
+    # 声明 Win32 API 函数签名
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [ctypes.wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = ctypes.wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [ctypes.wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
     # 创建进程快照
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
@@ -1052,8 +1099,14 @@ class CppDebugger:
         self._instances: dict[int, DebuggerBackend] = {}
         # 递增的调试器编号计数器（下一个可分配的编号）
         self._next_id: int = 1
-        # 每个实例的元信息：{"process_name": str, "pid": int, "mode": "launch"|"attach"}
+        # 每个实例的元信息：{"process_name": str, "pid": int, "mode": "launch"|"attach"|"waitfor"}
         self._instance_metadata: dict[int, dict] = {}
+        # 跨实例事件缓冲区：key 为实例编号，value 为待消费的事件消息列表
+        self._event_buffer: dict[int, list[str]] = {}
+        # waitfor 后台线程管理：key 为实例编号，value 为线程对象
+        self._waitfor_threads: dict[int, threading.Thread] = {}
+        # Windows Job Object 监控器管理：key 为实例编号
+        self._job_monitors: dict = {}
 
     def _detect_backend(self) -> DebuggerBackend:
         """自动检测并创建调试器后端"""
@@ -1094,17 +1147,50 @@ class CppDebugger:
         })
 
     def _is_attach_mode(self, debugger_id: int) -> bool:
-        """判断指定实例是否为 attach 模式"""
+        """判断指定实例是否为 attach 模式（包括 waitfor 已捕获的实例）"""
         meta = self._get_metadata(debugger_id)
-        return meta.get("mode") == "attach"
+        return meta.get("mode") in ("attach", "waitfor")
+
+    def _is_waitfor_waiting(self, debugger_id: int) -> bool:
+        """判断指定实例是否为 waitfor 模式且仍在等待中"""
+        meta = self._get_metadata(debugger_id)
+        return meta.get("mode") == "waitfor" and meta.get("status") == "waiting"
+
+    def _push_event(self, debugger_id: int, event_msg: str):
+        """向指定实例的事件缓冲区写入一条事件"""
+        if debugger_id not in self._event_buffer:
+            self._event_buffer[debugger_id] = []
+        self._event_buffer[debugger_id].append(event_msg)
+
+    def _consume_events_for_others(self, current_debugger_id: int) -> str:
+        """消费除 current_debugger_id 外所有实例的事件缓冲区，返回格式化的通知文本"""
+        notifications = []
+        for did in sorted(self._event_buffer.keys()):
+            if did == current_debugger_id:
+                continue
+            events = self._event_buffer.get(did, [])
+            if events:
+                for ev in events:
+                    notifications.append(f"  ⚡ [通知] {ev}")
+                self._event_buffer[did] = []
+        if not notifications:
+            return ""
+        return ("\n\n════════════════════════════════════\n"
+                "📢 其他调试会话状态变化：\n"
+                + "\n".join(notifications)
+                + "\n════════════════════════════════════")
 
     def _format_output(self, debugger_id: int, output: str) -> str:
-        """为返回内容添加调试器实例标识前缀（半结构化文本标注）"""
+        """为返回内容添加调试器实例标识前缀（半结构化文本标注），并附带跨实例事件通知"""
         meta = self._get_metadata(debugger_id)
         process_name = meta.get("process_name", "未知")
         pid = meta.get("pid", 0)
         prefix = f"[调试器 #{debugger_id}][进程: {process_name} (PID: {pid})]"
-        return f"{prefix}\n{output}"
+        # 在返回前，先检查 waitfor 实例是否有新状态（轮询式检测）
+        self._poll_waitfor_status()
+        # 附带跨实例事件通知
+        cross_notify = self._consume_events_for_others(debugger_id)
+        return f"{prefix}\n{output}{cross_notify}"
 
     def _update_metadata_pid(self, debugger_id: int):
         """尝试从调试器输出中获取并更新被调试进程的 PID"""
@@ -1150,8 +1236,10 @@ class CppDebugger:
 
     def start(self, env_vars: Optional[dict] = None) -> str:
         if self.is_active:
-            return f"[状态:已启动] **调试后端: {self._backend_name}**\n{self._backend_name} 会话已在运行中。"
+            return f"[状态:已启动] **调试后端: {self._backend_name}**\n{self._backend_name} 会话已在运行中。\nnext=[debug_load, debug_stop]"
+        _logger.info("CppDebugger.start 检测后端...")
         backend = self._detect_backend()
+        _logger.info("检测到后端: %s", self._backend_name)
         result = backend.start(env_vars=env_vars)
         # 检查后端是否真正启动成功，如果进程已退出则清理
         if not backend.is_active:
@@ -1167,24 +1255,35 @@ class CppDebugger:
 
     def stop(self) -> str:
         if not self._instances:
-            return "[状态:未启动] 调试会话未启动。"
+            return "[状态:未启动] 调试会话未启动。\nnext=[debug_start]"
+        _logger.info("CppDebugger.stop 停止所有调试器实例（共 %d 个）", len(self._instances))
         results = []
         # 先 detach 所有子实例（#1 及以上）
         child_ids = sorted([k for k in self._instances if k > 0], reverse=True)
         for cid in child_ids:
+            meta = self._instance_metadata.get(cid, {})
+            is_waitfor_waiting = (meta.get("mode") == "waitfor" and meta.get("status") == "waiting")
             try:
                 inst = self._instances[cid]
-                if inst.is_active:
+                if inst is not None and inst.is_active and not is_waitfor_waiting:
                     inst.detach()
-                inst.stop()
+                if inst is not None:
+                    inst.stop()
             except Exception:
                 try:
-                    inst.stop()
+                    if inst is not None:
+                        inst.stop()
                 except Exception:
                     pass
+            # 清理 Job Object 监控器
+            job_monitor = self._job_monitors.pop(cid, None)
+            if job_monitor:
+                job_monitor.stop()
             results.append(f"调试器 #{cid} 已关闭")
             del self._instances[cid]
             self._instance_metadata.pop(cid, None)
+            self._event_buffer.pop(cid, None)
+            self._waitfor_threads.pop(cid, None)
         # 再停止主实例 #0
         if 0 in self._instances:
             result = self._instances[0].stop()
@@ -1192,25 +1291,293 @@ class CppDebugger:
             del self._instances[0]
             self._instance_metadata.pop(0, None)
         else:
-            results.append("[状态:未启动] 主调试器未启动。")
+            results.append("[状态:未启动] 主调试器未启动。\nnext=[debug_start]")
         self._next_id = 1
         return "\n".join(results)
 
+    def _poll_waitfor_status(self):
+        """检查所有 waitfor 实例的后台输出，判断是否已成功 attach"""
+        for did in list(self._instances.keys()):
+            meta = self._instance_metadata.get(did, {})
+            if meta.get("mode") != "waitfor" or meta.get("status") != "waiting":
+                continue
+            backend = self._instances[did]
+            # Windows Job Object 模式下，等待中的实例后端可能为 None（后端在子进程被捕获后才创建）
+            if backend is None:
+                continue
+            if not backend.is_active:
+                # 调试器进程已退出，标记为失败
+                meta["status"] = "failed"
+                process_name = meta.get("process_name", "未知")
+                self._push_event(did, f"[调试器 #{did}][事件:waitfor_failed] waitfor 失败：调试器进程意外退出")
+                continue
+            # 非阻塞检查输出队列中是否有 attach 成功的信号
+            new_lines = []
+            while not backend._output_queue.empty():
+                try:
+                    line = backend._output_queue.get_nowait()
+                    new_lines.append(line)
+                except queue.Empty:
+                    break
+            if not new_lines:
+                continue
+            combined = "".join(new_lines)
+            # 检测 attach 成功的信号
+            lower = combined.lower()
+            attach_success = any(kw in lower for kw in [
+                "process attached", "process re-attached",
+                "attached to process", "stop reason",
+                "stopped", "breakpoint"
+            ])
+            if attach_success:
+                meta["status"] = "attached"
+                # 尝试从输出中提取 PID
+                pid_match = re.search(r'[Pp]rocess\s+(\d+)', combined)
+                if pid_match:
+                    meta["pid"] = int(pid_match.group(1))
+                process_name = meta.get("process_name", "未知")
+                pid_val = meta.get("pid", 0)
+                self._push_event(did, f"[调试器 #{did}][事件:waitfor_triggered] waitfor 已触发：已附加到 {process_name} (PID: {pid_val})，当前状态: 已暂停")
+                # 将输出追加到程序输出缓存
+                cleaned = backend._clean_prompt(combined).strip() if hasattr(backend, '_clean_prompt') else combined.strip()
+                backend._accumulate_program_output(cleaned)
+            else:
+                # 可能是其他输出（如 attach 过程中的进度信息），放回缓存
+                # 由于无法放回队列，先存到 pending_output
+                cleaned = backend._clean_prompt(combined).strip() if hasattr(backend, '_clean_prompt') else combined.strip()
+                if cleaned:
+                    backend._pending_output = (backend._pending_output + "\n" + cleaned).strip()
+
+    def _waitfor_monitor_thread(self, debugger_id: int, process_name: str):
+        """waitfor 实例的后台监控线程：持续检查 attach 是否成功"""
+        # 此线程只负责在 attach 完成后推送事件
+        # 实际的 attach 检测通过 _poll_waitfor_status 在每次工具调用时轮询完成
+        # 此线程作为补充：在长时间无工具调用时也能检测到状态变化
+        backend = self._instances.get(debugger_id)
+        if not backend:
+            return
+        meta = self._instance_metadata.get(debugger_id, {})
+        while meta.get("status") == "waiting" and backend.is_active:
+            time.sleep(0.5)
+            # 调用轮询检测
+            self._poll_waitfor_status()
+            # 如果状态已不是 waiting，退出线程
+            if meta.get("status") != "waiting":
+                break
+
+    def create_instance(self, process_name: str) -> str:
+        """创建新的调试器实例（waitfor 模式），等待指定名称的子进程启动后自动附加。
+
+        平台实现策略：
+        - Windows 8+：通过 Job Object + IOCP 内核级监控子进程创建，然后自动 attach
+        - Linux/macOS：通过 lldb 的 process attach --waitfor 命令（仅 lldb 后端支持）
+
+        Args:
+            process_name: 要等待的子进程可执行文件名（不含路径）
+
+        Returns:
+            创建结果，包含新调试器实例编号
+        """
+        _logger.info("create_instance 请求，process_name=%s", process_name)
+        if not self.is_active:
+            return "[错误] 主调试器未启动，请先调用 debug_start 启动调试会话。\nnext=[debug_start]"
+        if len(self._instances) >= self.MAX_INSTANCES:
+            return f"[错误] 调试器实例数量已达上限（{self.MAX_INSTANCES}），请先 detach 不需要的实例。\nnext=[debug_detach, debug_list_debuggers]"
+
+        if platform.system() == "Windows":
+            return self._create_instance_win_job(process_name)
+        else:
+            return self._create_instance_lldb_waitfor(process_name)
+
+    def _create_instance_lldb_waitfor(self, process_name: str) -> str:
+        """非 Windows 平台：通过 lldb 的 process attach --waitfor 命令实现"""
+        if self._backend_name != "lldb":
+            return "[错误] waitfor 模式在非 Windows 平台仅支持 lldb 后端，当前使用的是 " + str(self._backend_name) + "\nnext=[debug_stop]"
+        # 创建新 LLDB 后端实例
+        backend = self._create_backend()
+        result = backend.start()
+        if not backend.is_active:
+            return f"[错误] 无法启动新的调试器实例：\n{result}\nnext=[debug_create_instance]"
+        # 发送 waitfor 命令（非阻塞方式：直接写入 stdin，不等待完成）
+        try:
+            with backend._lock:
+                # 先清空旧数据
+                backend._drain_queue_to_output_cache()
+                # 发送 process attach --name <name> --waitfor 命令
+                cmd = f"process attach --name {process_name} --waitfor"
+                backend._process.stdin.write(cmd + "\n")
+                backend._process.stdin.flush()
+        except Exception as e:
+            backend.stop()
+            return f"[错误] 发送 waitfor 命令失败：{e}\nnext=[debug_create_instance]"
+        # 分配编号并注册
+        debugger_id = self._next_id
+        self._next_id += 1
+        self._instances[debugger_id] = backend
+        self._instance_metadata[debugger_id] = {
+            "process_name": process_name,
+            "pid": 0,
+            "mode": "waitfor",
+            "status": "waiting"  # waiting -> attached -> (正常调试)
+        }
+        self._event_buffer[debugger_id] = []
+        # 启动后台监控线程
+        monitor = threading.Thread(
+            target=self._waitfor_monitor_thread,
+            args=(debugger_id, process_name),
+            daemon=True
+        )
+        monitor.start()
+        self._waitfor_threads[debugger_id] = monitor
+        return self._format_output(debugger_id,
+            f"[状态:等待中] 正在等待进程 '{process_name}' 启动...\n"
+            f"已创建 waitfor 实例 (调试器 #{debugger_id})。\n"
+            f"下一步：切换到主调试器，继续执行程序以触发子进程启动。\n"
+            f"当子进程被捕获时，通知会附带在其他工具的返回值中。\n"
+            f"next=[debug_switch_debugger, debug_continue, debug_list_debuggers]")
+
+    def _create_instance_win_job(self, process_name: str) -> str:
+        """Windows 平台：通过 Job Object + IOCP 监控子进程创建，然后自动 attach"""
+        try:
+            from win_job_monitor import JobMonitor, is_supported
+        except ImportError:
+            return "[错误] win_job_monitor 模块不可用\nnext=[debug_create_instance]"
+        if not is_supported():
+            return "[错误] 当前 Windows 版本不支持此功能（需要 Windows 8 或更高版本）\nnext=[debug_list_children]"
+        # 获取被调试进程的 PID（需要主调试器已运行程序）
+        main_backend = self._instances.get(0)
+        if not main_backend:
+            return "[错误] 主调试器未启动\nnext=[debug_start]"
+        target_pid = self._get_process_pid(main_backend)
+        if not target_pid:
+            return ("[错误] 无法获取被调试进程的 PID。\n"
+                    "请确保已调用 debug_run 运行程序（程序需处于运行中或断点暂停状态）。\n"
+                    "next=[debug_run]")
+        # 验证进程是否仍然存活（LLDB/GDB 可能返回已退出进程的 PID）
+        try:
+            from win_job_monitor import is_process_alive
+            if not is_process_alive(target_pid):
+                return (f"[错误] 被调试进程 (PID: {target_pid}) 已退出，无法创建 waitfor 实例。\n"
+                        f"请先确保被调试进程处于运行中或断点暂停状态。\n"
+                        f"正确的流程：先在父进程中设好断点 → debug_run(stop_at_entry=True) → debug_create_instance → debug_continue\n"
+                        f"next=[debug_run]")
+        except ImportError:
+            pass
+        # 预分配编号
+        debugger_id = self._next_id
+        self._next_id += 1
+        # 注册元信息（此时还没有后端实例，后端在子进程被捕获后才创建）
+        self._instance_metadata[debugger_id] = {
+            "process_name": process_name,
+            "pid": 0,
+            "mode": "waitfor",
+            "status": "waiting"
+        }
+        self._event_buffer[debugger_id] = []
+        # 用一个占位后端（None），在 _get_instance 中会检查
+        self._instances[debugger_id] = None  # type: ignore
+        # 创建 Job Object 监控器
+        job_monitor = JobMonitor()
+
+        def on_child_found(child_pid: int, child_name: str):
+            """子进程被捕获时的回调（在监控线程中执行）"""
+            self._handle_win_job_child_found(debugger_id, child_pid, child_name, process_name)
+
+        err = job_monitor.start(
+            target_pid=target_pid,
+            process_name=process_name,
+            callback=on_child_found,
+        )
+        if err:
+            # 启动失败，清理
+            del self._instances[debugger_id]
+            self._instance_metadata.pop(debugger_id, None)
+            self._event_buffer.pop(debugger_id, None)
+            self._next_id -= 1
+            return f"[错误] 启动子进程监控失败：{err}\nnext=[debug_create_instance]"
+
+        self._job_monitors[debugger_id] = job_monitor
+
+        # 启动一个补充监控线程，用于检测 Job Monitor 的错误和超时
+        monitor = threading.Thread(
+            target=self._win_job_monitor_thread,
+            args=(debugger_id, job_monitor),
+            daemon=True
+        )
+        monitor.start()
+        self._waitfor_threads[debugger_id] = monitor
+
+        return self._format_output(debugger_id,
+            f"[状态:等待中] 正在等待进程 '{process_name}' 启动...\n"
+            f"已创建 waitfor 实例 (调试器 #{debugger_id})。\n"
+            f"监控方式：Windows Job Object（内核级子进程创建通知）\n"
+            f"下一步：切换到主调试器，继续执行程序以触发子进程启动。\n"
+            f"当子进程被捕获时，通知会附带在其他工具的返回值中。\n"
+            f"next=[debug_switch_debugger, debug_continue, debug_list_debuggers]")
+
+    def _handle_win_job_child_found(self, debugger_id: int, child_pid: int,
+                                     child_name: str, expected_name: str):
+        """Windows Job Object 监控回调：子进程被捕获后，创建新后端并 attach"""
+        _logger.info("win_job 子进程已捕获: debugger_id=%d, child_pid=%d, child_name=%s",
+                     debugger_id, child_pid, child_name)
+        meta = self._instance_metadata.get(debugger_id)
+        if not meta or meta.get("status") != "waiting":
+            return
+        try:
+            # 创建新的调试器后端并 attach 到子进程
+            backend = self._create_backend()
+            result = backend.start()
+            if not backend.is_active:
+                meta["status"] = "failed"
+                self._push_event(debugger_id,
+                    f"[调试器 #{debugger_id}][事件:waitfor_failed] waitfor 失败：无法启动调试器后端")
+                return
+            attach_result = backend.attach(child_pid)
+            if not backend.is_active:
+                meta["status"] = "failed"
+                self._push_event(debugger_id,
+                    f"[调试器 #{debugger_id}][事件:waitfor_failed] waitfor 失败：无法 attach 到 PID {child_pid}")
+                return
+            # 更新实例
+            self._instances[debugger_id] = backend
+            meta["status"] = "attached"
+            meta["pid"] = child_pid
+            self._push_event(debugger_id,
+                f"[调试器 #{debugger_id}][事件:waitfor_triggered] waitfor 已触发：已附加到 {child_name} (PID: {child_pid})，当前状态: 已暂停")
+        except Exception as e:
+            meta["status"] = "failed"
+            self._push_event(debugger_id,
+                f"[调试器 #{debugger_id}] waitfor 失败：{e}")
+
+    def _win_job_monitor_thread(self, debugger_id: int, job_monitor):
+        """Windows Job Object 监控的补充线程：检测 JobMonitor 的错误"""
+        meta = self._instance_metadata.get(debugger_id, {})
+        while meta.get("status") == "waiting":
+            time.sleep(0.5)
+            if not job_monitor.is_running and not job_monitor.found_pid:
+                # 监控线程已退出且未找到目标进程
+                if job_monitor.error:
+                    meta["status"] = "failed"
+                    self._push_event(debugger_id,
+                        f"[调试器 #{debugger_id}][事件:waitfor_failed] waitfor 失败：{job_monitor.error}")
+                break
+
     def attach_child(self, pid: int) -> str:
         """创建新的调试器实例并附加到指定 PID 的子进程"""
+        _logger.info("attach_child 请求，pid=%d", pid)
         if not self.is_active:
-            return "[错误] 主调试器未启动，请先调用 debug_start 启动调试会话。"
+            return "[错误] 主调试器未启动，请先调用 debug_start 启动调试会话。\nnext=[debug_start]"
         if len(self._instances) >= self.MAX_INSTANCES:
-            return f"[错误] 调试器实例数量已达上限（{self.MAX_INSTANCES}），请先 detach 不需要的实例。"
+            return f"[错误] 调试器实例数量已达上限（{self.MAX_INSTANCES}），请先 detach 不需要的实例。\nnext=[debug_detach, debug_list_debuggers]"
         # 创建新后端实例
         backend = self._create_backend()
         result = backend.start()
         if not backend.is_active:
-            return f"[错误] 无法启动新的调试器实例：\n{result}"
+            return f"[错误] 无法启动新的调试器实例：\n{result}\nnext=[debug_attach_child]"
         # 发送 attach 命令
         attach_result = backend.attach(pid)
         if not backend.is_active:
-            return f"[错误] 无法附加到进程 {pid}：\n{attach_result}"
+            return f"[错误] 无法附加到进程 {pid}：\n{attach_result}\nnext=[debug_attach_child, debug_list_children]"
         # 分配编号
         debugger_id = self._next_id
         self._next_id += 1
@@ -1229,48 +1596,65 @@ class CppDebugger:
             "mode": "attach"
         }
         return self._format_output(debugger_id,
-                                    f"[状态: 已暂停] 已附加到进程 (PID: {pid})\n{attach_result}")
+                                    f"[状态:已暂停] 已附加到进程 (PID: {pid})\n{attach_result}\n"
+                                    f"next=[debug_source_context, debug_get_variables, debug_backtrace, debug_step_over, debug_step_into, debug_continue]")
 
     def detach_child(self, debugger_id: int) -> str:
         """从子进程脱离并关闭对应的调试器实例"""
+        _logger.info("detach_child 请求，debugger_id=%d", debugger_id)
         if debugger_id == 0:
-            return "[错误] 无法脱离主调试器，请使用 debug_stop 结束整个调试会话"
+            return "[错误] 无法脱离主调试器，请使用 debug_stop 结束整个调试会话\nnext=[debug_stop]"
         if debugger_id not in self._instances:
-            return f"[错误] 调试器 #{debugger_id} 不存在"
+            return f"[错误] 调试器 #{debugger_id} 不存在\nnext=[debug_list_debuggers]"
         backend = self._instances[debugger_id]
+        meta = self._instance_metadata.get(debugger_id, {})
+        is_waitfor_waiting = (meta.get("mode") == "waitfor" and meta.get("status") == "waiting")
         result = ""
-        try:
-            if backend.is_active:
-                result = backend.detach()
-        except Exception as e:
-            result = f"detach 失败: {e}"
-        # 无论 detach 是否成功，都清理实例资源
-        try:
-            backend.stop()
-        except Exception:
-            pass
+        if backend is not None:
+            try:
+                if backend.is_active:
+                    if is_waitfor_waiting:
+                        # waitfor 等待中：还没 attach 上，无需 detach，直接 quit
+                        pass
+                    else:
+                        result = backend.detach()
+            except Exception as e:
+                result = f"detach 失败: {e}"
+            # 无论 detach 是否成功，都清理实例资源
+            try:
+                backend.stop()
+            except Exception:
+                pass
+        # 清理 Job Object 监控器
+        job_monitor = self._job_monitors.pop(debugger_id, None)
+        if job_monitor:
+            job_monitor.stop()
         del self._instances[debugger_id]
         meta = self._instance_metadata.pop(debugger_id, {})
+        self._event_buffer.pop(debugger_id, None)
+        self._waitfor_threads.pop(debugger_id, None)
         process_name = meta.get("process_name", "未知")
         pid = meta.get("pid", 0)
+        if is_waitfor_waiting:
+            return f"[调试器 #{debugger_id}] 已取消 waitfor 等待并关闭（进程: {process_name}）"
         return f"[调试器 #{debugger_id}] 已从进程 {process_name} (PID: {pid}) 脱离并关闭\n{result}"
 
     def list_children(self, debugger_id: int = 0) -> str:
         """列出指定调试器实例所控制进程的子进程"""
         if debugger_id not in self._instances:
-            return f"[错误] 调试器 #{debugger_id} 不存在"
+            return f"[错误] 调试器 #{debugger_id} 不存在\nnext=[debug_list_debuggers]"
         backend = self._instances[debugger_id]
         if not backend.is_active:
-            return "[错误] 调试器未启动，无法获取子进程列表"
+            return "[错误] 调试器未启动，无法获取子进程列表\nnext=[debug_start]"
         # 获取被调试进程的 PID
         pid = self._get_process_pid(backend)
         if not pid:
-            return "[错误] 无法获取被调试进程的 PID。程序可能尚未运行（未调用 debug_run），不存在子进程。"
+            return "[错误] 无法获取被调试进程的 PID。程序可能尚未运行（未调用 debug_run），不存在子进程。\nnext=[debug_run]"
         # 调用平台相关的子进程列表获取函数
         try:
             children = list_child_processes(pid)
         except Exception as e:
-            return f"[错误] 获取子进程列表失败：{e}\n建议：请手动提供子进程 PID，使用 debug_attach_child(pid) 附加。"
+            return f"[错误] 获取子进程列表失败：{e}\n建议：请手动提供子进程 PID，使用 debug_attach_child(pid) 附加。\nnext=[debug_attach_child]"
         if not children:
             return self._format_output(debugger_id, f"当前进程 (PID: {pid}) 没有子进程。")
         lines = [f"当前进程 (PID: {pid}) 的子进程列表："]
@@ -1281,7 +1665,9 @@ class CppDebugger:
     def list_debuggers(self) -> str:
         """返回所有活跃调试器实例的列表"""
         if not self._instances:
-            return "[状态:未启动] 没有活跃的调试器实例。"
+            return "[状态:未启动] 没有活跃的调试器实例。\nnext=[debug_start]"
+        # 先轮询 waitfor 状态
+        self._poll_waitfor_status()
         lines = ["当前活跃的调试器实例："]
         for did in sorted(self._instances.keys()):
             backend = self._instances[did]
@@ -1289,15 +1675,28 @@ class CppDebugger:
             process_name = meta.get("process_name", "未知")
             pid = meta.get("pid", 0)
             mode = meta.get("mode", "unknown")
-            status = "活跃" if backend.is_active else "已结束"
-            mode_label = "主调试器(launch)" if mode == "launch" else "子调试器(attach)"
+            waitfor_status = meta.get("status", "")
+            if mode == "launch":
+                mode_label = "主调试器(launch)"
+            elif mode == "waitfor":
+                if waitfor_status == "waiting":
+                    mode_label = "子调试器(waitfor:等待中)"
+                elif waitfor_status == "attached":
+                    mode_label = "子调试器(waitfor:已捕获)"
+                else:
+                    mode_label = f"子调试器(waitfor:{waitfor_status})"
+            else:
+                mode_label = "子调试器(attach)"
+            status = "活跃" if (backend is not None and backend.is_active) else "等待中" if backend is None else "已结束"
             lines.append(f"  调试器 #{did} | {mode_label} | 进程: {process_name} (PID: {pid}) | 状态: {status}")
-        return "\n".join(lines)
+        # 附带跨实例事件通知
+        cross_notify = self._consume_events_for_others(-1)  # -1 表示不排除任何实例
+        return "\n".join(lines) + cross_notify
 
     def get_program_output_safe(self, mode: str = "all", lines: int = 20, debugger_id: int = 0) -> str:
         """安全版本：即使后端未初始化也不会抛异常"""
         if debugger_id not in self._instances:
-            return "[状态:未启动] 调试会话未启动，没有程序输出。"
+            return "[状态:未启动] 调试会话未启动，没有程序输出。\nnext=[debug_start]"
         backend = self._instances[debugger_id]
         result = backend.get_program_output_safe(mode=mode, lines=lines)
         return self._format_output(debugger_id, result)
@@ -1305,7 +1704,7 @@ class CppDebugger:
     def get_pending_output_safe(self, debugger_id: int = 0) -> str:
         """安全版本的 get_pending_output，即使未启动也不会抛异常"""
         if debugger_id not in self._instances:
-            return "[状态:未启动] 调试器未启动，没有待处理的输出。"
+            return "[状态:未启动] 调试器未启动，没有待处理的输出。\nnext=[debug_start]"
         backend = self._instances[debugger_id]
         result = backend.get_pending_output_safe()
         return self._format_output(debugger_id, result)
